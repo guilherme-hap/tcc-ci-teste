@@ -1,0 +1,96 @@
+name: Auditoria da API
+
+on:
+  workflow_dispatch:
+    inputs:
+      min-score:
+        description: Nota final mínima
+        default: '50'
+
+jobs:
+  auditoria:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: auditor
+          POSTGRES_PASSWORD: auditor
+          POSTGRES_DB: auditor
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U auditor"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      petstore:
+        image: swaggerapi/petstore3:unstable
+        ports:
+          - 8080:8080
+
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Aguarda a API avaliada
+        run: curl --retry 30 --retry-delay 2 --retry-connrefused --retry-all-errors -fsS http://localhost:8080/api/v3/openapi.json > /dev/null
+
+      - name: Baixa o auditor
+        uses: actions/checkout@v4
+        with:
+          repository: guilherme-hap/tcc-backend
+          path: auditor
+
+      - name: Sobe o auditor
+        working-directory: auditor
+        env:
+          PORT: 3000
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: auditor
+          DB_PASSWORD: auditor
+          DB_NAME: auditor
+          DB_AUTO_CREATE: 'false'
+          JWT_SECRET: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          npm ci
+          npm run build
+          npm start > auditor.log 2>&1 &
+          curl --retry 30 --retry-delay 2 --retry-connrefused -fsS http://localhost:3000/api/rules > /dev/null
+
+      - name: Monta o pedido
+        run: |
+          cat > request.json <<'JSON'
+          {
+            "openApiUrl": "http://localhost:8080/api/v3/openapi.json",
+            "apiBaseUrl": "http://localhost:8080/api/v3",
+            "targets": [
+              { "path": "/pet/1", "method": "GET" },
+              { "path": "/user/user1", "method": "GET" }
+            ],
+            "loadTestOptions": { "duration": 10, "connections": 10 }
+          }
+          JSON
+
+      - name: Audita a API
+        run: >-
+          node auditor/dist/cli/audit.js
+          --api http://localhost:3000
+          --type full
+          --request request.json
+          --min-score ${{ inputs.min-score }}
+          --output auditoria.json
+
+      - name: Guarda o resultado
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auditoria
+          path: |
+            auditoria.json
+            auditor/auditor.log
+          if-no-files-found: ignore
